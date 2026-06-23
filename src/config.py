@@ -1,0 +1,10 @@
+# config for p1
+BERT_MODEL_NAME = "bert-base-uncased"
+BERT_HIDDEN_SIZE = 768
+EMBEDDING_DIM = 128
+BATCH_SIZE = 64
+NUM_EPOCHS = 3
+LEARNING_RATE = 1e-3
+MAX_TRAIN_SAMPLES = 50_000
+MODEL_DIR = "models"
+RESULTS_CSV = "ablation_results.csv"
