@@ -50,9 +50,9 @@ E5-small-v2 gets 0.8594, but it was trained on 270M pairs with full fine-tuning.
 
 ## What I found
 
-- **Temperature matters more than I expected.** 0.07 was the sweet spot. 0.05 made training noisy (gradients blow up through the softmax), 0.10 made all negatives look equally easy.
-- **Mean pooling crushed CLS with frozen BERT.** 0.642 vs 0.452 -- a 19-point gap. CLS was pretrained for next-sentence prediction, not for summarizing a sentence. It only works if you fine-tune.
-- **The big jump came from supervised training.** Going from unsupervised (0.642) to supervised with hard negatives and unfreezing (0.781) was the main improvement. Dropout noise just isn't as informative as real entailment/contradiction pairs.
+- **Temperature matters more than I expected.** 0.07 was the sweet spot. At 0.05, training became less stable and performance dropped.
+- **Mean pooling consistently outperformed CLS pooling with frozen BERT.** 0.642 vs 0.452 -- a 19-point gap. CLS was pretrained for next-sentence prediction, not for summarizing a sentence. It only works if you fine-tune.
+- **The largest improvement came after switching to supervised SimCSE with SNLI hard negatives.** Going from unsupervised (0.642) to supervised with hard negatives and unfreezing (0.781) was the main improvement. Hard negatives from SNLI provided a much stronger training signal than dropout-based positive pairs.
 - **Freezing BERT caps performance around 0.64.** The projection head can only rearrange frozen features. Unfreezing lets the model learn what actually matters for similarity.
 
 ## Methodology
