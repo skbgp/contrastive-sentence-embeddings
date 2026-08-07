@@ -1,4 +1,4 @@
-# Sentence Embedding Trainer
+# Contrastive Sentence Embeddings
 
 Contrastive sentence encoder using frozen BERT + InfoNCE loss. Trains a lightweight projection head to produce sentence embeddings, evaluated on STS-Benchmark.
 
