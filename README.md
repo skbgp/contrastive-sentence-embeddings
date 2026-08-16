@@ -1,4 +1,4 @@
-# Contrastive Sentence Embeddings
+# Unsupervised Contrastive Learning for Sentence Embeddings
 
 Training a sentence encoder using unsupervised SimCSE. The idea is simple: take a sentence, pass it through BERT twice with different dropout masks, and use contrastive learning to pull the two views together while pushing apart everything else in the batch.
 
