@@ -24,7 +24,7 @@ class config:
     EMBEDDING_DIM = 128
     BATCH_SIZE = 64
     NUM_EPOCHS = 3
-    LEARNING_RATE = 1e-3
+    LEARNING_RATE = 3e-5  # Lower learning rate for fine-tuning BERT
     MAX_TRAIN_SAMPLES = 50_000
     MODEL_DIR = "models"
     RESULTS_CSV = "ablation_results.csv"
@@ -44,6 +44,7 @@ class SentenceDataset(Dataset):
         return self.sentences[idx], self.sentences[idx]
 
 def load_sentences():
+    from datasets import load_dataset
     dataset = load_dataset("stanfordnlp/snli", split="train")
     sentences = []
     for example in dataset:
@@ -99,9 +100,8 @@ class SentenceEmbeddingModel(nn.Module):
         super().__init__()
         self.bert = AutoModel.from_pretrained(config.BERT_MODEL_NAME)
 
-        # freeze bert so we dont run out of mem on kaggle
-        for param in self.bert.parameters():
-            param.requires_grad = False
+        # Enable gradient checkpointing to save VRAM when fine-tuning full BERT
+        self.bert.gradient_checkpointing_enable()
 
         if projection == "nonlinear":
             self.projection_head = nn.Sequential(
@@ -131,10 +131,8 @@ class SentenceEmbeddingModel(nn.Module):
         raise ValueError(f"unknown pooling: {self.pooling}")
 
     def forward(self, input_ids, attention_mask):
-        # no_grad skips tracking for bert graph, saves vram
-        with torch.no_grad():
-            output = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-            pooled = self._pool(output.last_hidden_state, attention_mask)
+        output = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = self._pool(output.last_hidden_state, attention_mask)
 
         return self.projection_head(pooled)
 
@@ -174,7 +172,7 @@ def train_one(cfg, sentences, tokenizer, device):
     set_seed(cfg.seed)
     loader = make_loader(sentences, tokenizer)
     model = SentenceEmbeddingModel(pooling=cfg.pooling, projection=cfg.projection).to(device)
-    optimizer = torch.optim.Adam(model.projection_head.parameters(), lr=config.LEARNING_RATE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
     best_loss = float("inf")
@@ -356,7 +354,7 @@ def main():
     print(f"e5-small-v2 stsb spearman: {e5_score:.4f}")
     print("\nfor the resume:")
     print(
-        f"contrastive sentence encoder, frozen bert + infonce, "
+        f"contrastive sentence encoder, finetuned bert + infonce, "
         f"{mean:.4f} +/- {std:.4f} stsb spearman (5 seeds), "
         f"ablated temp/pooling/projection"
     )

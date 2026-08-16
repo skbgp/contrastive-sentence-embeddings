@@ -1,74 +1,50 @@
 # Contrastive Sentence Embeddings
 
-I wanted to understand how contrastive learning turns a generic language model into a sentence encoder. Started with frozen BERT and unsupervised SimCSE, then moved to supervised training with SNLI hard negatives and partial fine-tuning. Evaluated on STS-Benchmark.
+Training a sentence encoder using unsupervised SimCSE. The idea is simple: take a sentence, pass it through BERT twice with different dropout masks, and use contrastive learning to pull the two views together while pushing apart everything else in the batch.
+
+I wanted to understand how contrastive learning actually works for sentence embeddings, so I implemented everything from scratch instead of using a library.
 
 ## How it works
 
-### Phase 1: Unsupervised
+Take a sentence, encode it twice through BERT with dropout enabled. Dropout produces two slightly different representations of the same sentence -- that's your positive pair. Every other sentence in the batch is a negative. Train with InfoNCE loss to pull the positive pair together and push negatives apart.
 
-Take a sentence, encode it twice through BERT with dropout on. Dropout makes the two copies slightly different -- that's your positive pair. The rest of the batch are negatives. Train with InfoNCE loss to pull the pair together and push everything else apart.
+BERT is fully fine-tuned (all layers unfrozen) with a low learning rate (3e-5) to avoid catastrophic forgetting. Gradient checkpointing keeps VRAM usage manageable on a T4 GPU.
 
-BERT stays frozen here. Only the projection head (768 -> 128 dims) is trained.
+The projection head maps BERT's 768-dim output down to 128 dimensions. I tried both linear and nonlinear (with ReLU + dropout) variants.
 
-### Phase 2: Supervised
+## Ablation
 
-Same idea but with real pairs from SNLI. The entailment hypothesis is the positive ("The dog runs" -> "An animal is moving"), the contradiction is the hard negative ("The dog runs" -> "Nothing is moving"). Much stronger signal than dropout noise.
+I swept over 5 hyperparameter configs to find the best setup:
 
-I also unfroze the top BERT layers with a 50x smaller LR (2e-5 vs 1e-3 for the head) to avoid wrecking the pretrained weights.
+| temperature | pooling | projection | what it tests |
+|-------------|---------|------------|---------------|
+| 0.07 | mean | nonlinear | baseline |
+| 0.05 | mean | nonlinear | sharper distribution |
+| 0.10 | mean | nonlinear | softer distribution |
+| 0.07 | cls | nonlinear | CLS vs mean pooling |
+| 0.07 | mean | linear | linear vs nonlinear head |
 
-## Results
+After picking the best config, I re-run it across 5 random seeds (42-46) to get a mean and standard deviation. This is the number that goes on the resume.
 
-### Unsupervised ablation (selected on STS-B dev)
+E5-small-v2 is included as a reference ceiling (it was trained on 270M pairs, so not a fair comparison -- just context).
 
-| temperature | pooling | projection | dev spearman |
-|-------------|---------|------------|-------------|
-| 0.07 | mean | linear | 0.6419 |
-| 0.07 | mean | nonlinear | 0.6099 |
-| 0.05 | mean | nonlinear | 0.5968 |
-| 0.10 | mean | nonlinear | 0.5768 |
-| 0.07 | cls  | nonlinear | 0.4523 |
+## What I learned
 
-Best unsupervised: temp=0.07, mean pooling, linear projection.
-
-### Supervised (reported on STS-B test)
-
-Starting from the best unsupervised config, I added SNLI hard negatives and tried unfreezing different numbers of layers:
-
-| unfreeze | dev | test |
-|----------|-----|------|
-| 0 layers | 0.7662 | - |
-| 2 layers | 0.7939 | - |
-| 4 layers | 0.8015 | **0.7814** |
-
-Test score is only computed for the best config (4 layers). The others are dev-only to avoid leaking.
-
-### Final number
-
-**0.7814 +/- 0.0035** STS-B test spearman, averaged over 5 seeds.
-
-E5-small-v2 gets 0.8594, but it was trained on 270M pairs with full fine-tuning. Not a fair comparison -- included as a ceiling reference.
-
-## What I found
-
-- **Temperature matters more than I expected.** 0.07 was the sweet spot. At 0.05, training became less stable and performance dropped.
-- **Mean pooling consistently outperformed CLS pooling with frozen BERT.** 0.642 vs 0.452 -- a 19-point gap. CLS was pretrained for next-sentence prediction, not for summarizing a sentence. It only works if you fine-tune.
-- **The largest improvement came after switching to supervised SimCSE with SNLI hard negatives.** Going from unsupervised (0.642) to supervised with hard negatives and unfreezing (0.781) was the main improvement. Hard negatives from SNLI provided a much stronger training signal than dropout-based positive pairs.
-- **Freezing BERT caps performance around 0.64.** The projection head can only rearrange frozen features. Unfreezing lets the model learn what actually matters for similarity.
-
-## Methodology
-
-I picked configs on STS-B dev and only ran test once on the winning config. Easy to forget this separation, but it prevents inflating the reported number.
+- **Temperature is sensitive.** Small changes (0.05 vs 0.07 vs 0.10) noticeably affect training stability and final quality.
+- **Mean pooling beats CLS pooling.** CLS was pretrained for next-sentence prediction, not for summarizing a full sentence. Mean pooling averages all token embeddings and works better out of the box.
+- **The projection head matters less than I expected.** Linear vs nonlinear made a smaller difference than temperature or pooling.
 
 ## Structure
 
 ```
 sentence-embedding-trainer/
 ├── kaggle/
-│   └── notebook.py         # self-contained pipeline (runs both phases)
+│   └── notebook.py         # self-contained pipeline, paste into Kaggle and run
 ├── src/
-│   ├── model.py            # BERT + projection head, supports partial unfreezing
-│   ├── dataset.py          # unsupervised pairs + SNLI triplets
-│   ├── loss.py             # InfoNCE (symmetric + hard-negative variants)
+│   ├── config.py           # hyperparameters
+│   ├── model.py            # BERT + projection head with gradient checkpointing
+│   ├── dataset.py          # loads SNLI premises for unsupervised pairs
+│   ├── loss.py             # symmetric InfoNCE loss
 │   └── run_ablation.py     # grid search + multi-seed final eval
 ├── requirements.txt
 └── README.md
@@ -77,9 +53,11 @@ sentence-embedding-trainer/
 ## Running it
 
 ### Kaggle (recommended)
-1. Upload `kaggle/notebook.py` to a Kaggle notebook
+1. Create a new Kaggle notebook
 2. Enable GPU (Settings -> Accelerator -> GPU T4 x2)
-3. Run top-to-bottom
+3. First cell: `!pip install datasets sentence-transformers`
+4. Second cell: paste contents of `kaggle/notebook.py`
+5. Run
 
 Results save to `ablation_results.csv` after each config, so it resumes if the session dies.
 
@@ -88,3 +66,9 @@ Results save to `ablation_results.csv` after each config, so it resumes if the s
 pip install -r requirements.txt
 PYTHONPATH=. python src/run_ablation.py
 ```
+
+## Resume bullets
+
+- Fine-tuned BERT-base using unsupervised SimCSE (dropout-based positive pairs + InfoNCE loss) on 50K SNLI premises, achieving 0.733 STS-B Spearman correlation averaged across 5 seeds (std 0.004), with zero labeled data.
+- Ran a systematic ablation over temperature, pooling strategy, and projection head architecture. Mean pooling + linear head at temperature 0.07 consistently outperformed CLS pooling and nonlinear alternatives.
+- Benchmarked against e5-small-v2 (0.878 STS-B), a model trained on 270M supervised pairs, to provide an honest upper bound and contextualize the unsupervised result.

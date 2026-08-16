@@ -8,9 +8,8 @@ class SentenceEmbeddingModel(nn.Module):
         super().__init__()
         self.bert = AutoModel.from_pretrained(config.BERT_MODEL_NAME)
         
-        # freeze bert so we dont run out of mem on kaggle
-        for param in self.bert.parameters():
-            param.requires_grad = False
+        # Enable gradient checkpointing to save VRAM when fine-tuning full BERT
+        self.bert.gradient_checkpointing_enable()
 
         if projection == "nonlinear":
             self.projection_head = nn.Sequential(
@@ -40,9 +39,7 @@ class SentenceEmbeddingModel(nn.Module):
         raise ValueError(f"unknown pooling: {self.pooling}")
 
     def forward(self, input_ids, attention_mask):
-        # no_grad skips tracking for bert graph, saves vram
-        with torch.no_grad():
-            output = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-            pooled = self._pool(output.last_hidden_state, attention_mask)
+        output = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = self._pool(output.last_hidden_state, attention_mask)
         
         return self.projection_head(pooled)

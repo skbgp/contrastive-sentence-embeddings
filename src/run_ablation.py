@@ -49,7 +49,7 @@ def train_one(cfg, sentences, tokenizer, device):
     set_seed(cfg.seed)
     loader = make_loader(sentences, tokenizer)
     model = SentenceEmbeddingModel(pooling=cfg.pooling, projection=cfg.projection).to(device)
-    optimizer = torch.optim.Adam(model.projection_head.parameters(), lr=config.LEARNING_RATE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
     
     best_loss = float("inf")
@@ -231,7 +231,7 @@ def main():
     print(f"e5-small-v2 stsb spearman: {e5_score:.4f}")
     print("\nfor the resume:")
     print(
-        f"contrastive sentence encoder, frozen bert + infonce, "
+        f"contrastive sentence encoder, finetuned bert + infonce, "
         f"{mean:.4f} +/- {std:.4f} stsb spearman (5 seeds), "
         f"ablated temp/pooling/projection"
     )
