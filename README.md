@@ -67,8 +67,3 @@ pip install -r requirements.txt
 PYTHONPATH=. python src/run_ablation.py
 ```
 
-## Resume bullets
-
-- Fine-tuned BERT-base using unsupervised SimCSE (dropout-based positive pairs + InfoNCE loss) on 50K SNLI premises, achieving 0.733 STS-B Spearman correlation averaged across 5 seeds (std 0.004), with zero labeled data.
-- Ran a systematic ablation over temperature, pooling strategy, and projection head architecture. Mean pooling + linear head at temperature 0.07 consistently outperformed CLS pooling and nonlinear alternatives.
-- Benchmarked against e5-small-v2 (0.878 STS-B), a model trained on 270M supervised pairs, to provide an honest upper bound and contextualize the unsupervised result.
