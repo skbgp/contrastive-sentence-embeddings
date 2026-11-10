@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 
 def info_nce_loss(a, b, temperature):
+    if temperature <= 0:
+        raise ValueError("Temperature must be positive.")
     # l2 normalize so dot product equals cosine similarity
     a = F.normalize(a, p=2, dim=1)
     b = F.normalize(b, p=2, dim=1)

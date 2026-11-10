@@ -6,3 +6,6 @@ models/
 *.csv
 trained_model/
 .vscode/
+.venv/
+smoke/
+.ablation.lock

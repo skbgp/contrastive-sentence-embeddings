@@ -1,21 +1,27 @@
-import gc
-import os
+import argparse
+import json
+import math
 import random
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
+from datasets import load_dataset
+from filelock import FileLock, Timeout
 from scipy.stats import spearmanr
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-import config
-from dataset import load_sentences, make_loader
-from model import SentenceEmbeddingModel
-from loss import info_nce_loss
-import torch.nn.functional as F
+from src import config
+from src.dataset import load_sentences, make_loader
+from src.loss import info_nce_loss
+from src.model import SentenceEmbeddingModel
 
 
 @dataclass(frozen=True)
@@ -45,37 +51,38 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def train_one(cfg, sentences, tokenizer, device):
+def train_one(cfg, sentences, tokenizer, device, batch_size=config.BATCH_SIZE, epochs=config.NUM_EPOCHS):
     set_seed(cfg.seed)
-    loader = make_loader(sentences, tokenizer)
+    loader = make_loader(sentences, tokenizer, batch_size=batch_size)
     model = SentenceEmbeddingModel(pooling=cfg.pooling, projection=cfg.projection).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
-    
+    use_amp = device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+
     best_loss = float("inf")
 
-    for epoch in range(config.NUM_EPOCHS):
+    for epoch in range(epochs):
         model.train()
         losses = []
-        for batch in tqdm(loader, desc=f"{cfg} epoch {epoch + 1}/{config.NUM_EPOCHS}"):
-            input_ids_a = batch["input_ids_a"].to(device)
-            attention_mask_a = batch["attention_mask_a"].to(device)
-            input_ids_b = batch["input_ids_b"].to(device)
-            attention_mask_b = batch["attention_mask_b"].to(device)
+        for batch in tqdm(loader, desc=f"{cfg} epoch {epoch + 1}/{epochs}"):
+            input_ids = batch["input_ids_a"].to(device)
+            attention_mask = batch["attention_mask_a"].to(device)
 
             optimizer.zero_grad()
 
-            # fp16 so we dont run out of vram on kaggle
-            with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", enabled=device.type == "cuda"):
-                emb_a = model(input_ids_a, attention_mask_a)
-                emb_b = model(input_ids_b, attention_mask_b)
+            with torch.autocast("cuda" if use_amp else "cpu", enabled=use_amp):
+                emb_a = model(input_ids, attention_mask)
+                emb_b = model(input_ids, attention_mask)
                 loss = info_nce_loss(emb_a, emb_b, cfg.temperature)
 
-            # amp scaler for stability
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            
+            if scaler is None:
+                loss.backward()
+                optimizer.step()
+            else:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
             losses.append(loss.item())
 
         avg_loss = float(np.mean(losses))
@@ -96,13 +103,8 @@ def encode(model, tokenizer, sentences, device):
     return torch.cat(outputs, dim=0)
 
 
-def evaluate_stsb(model, tokenizer, device):
-    from datasets import load_dataset
-    stsb = load_dataset("glue", "stsb", split="validation")
-    s1 = [ex["sentence1"] for ex in stsb]
-    s2 = [ex["sentence2"] for ex in stsb]
-    labels = [ex["label"] for ex in stsb]
-
+def evaluate_stsb(model, tokenizer, device, stsb):
+    s1, s2, labels = stsb
     e1 = F.normalize(encode(model, tokenizer, s1, device), p=2, dim=1)
     e2 = F.normalize(encode(model, tokenizer, s2, device), p=2, dim=1)
     sims = (e1 * e2).sum(dim=1).numpy()
@@ -110,131 +112,125 @@ def evaluate_stsb(model, tokenizer, device):
     return float(corr)
 
 
-def benchmark_e5():
-    from datasets import load_dataset
-    stsb = load_dataset("glue", "stsb", split="validation")
-    model = SentenceTransformer("intfloat/e5-small-v2")
-    s1 = ["query: " + ex["sentence1"] for ex in stsb]
-    s2 = ["query: " + ex["sentence2"] for ex in stsb]
-    labels = [ex["label"] for ex in stsb]
-    e1 = model.encode(s1, show_progress_bar=True)
-    e2 = model.encode(s2, show_progress_bar=True)
-    e1 = e1 / np.linalg.norm(e1, axis=1, keepdims=True)
-    e2 = e2 / np.linalg.norm(e2, axis=1, keepdims=True)
+def benchmark_e5(stsb, device):
+    s1, s2, labels = stsb
+    model = SentenceTransformer("intfloat/e5-small-v2", device=str(device))
+    e1 = model.encode(["query: " + s for s in s1], show_progress_bar=True, normalize_embeddings=True)
+    e2 = model.encode(["query: " + s for s in s2], show_progress_bar=True, normalize_embeddings=True)
     corr, _ = spearmanr(labels, (e1 * e2).sum(axis=1))
     return float(corr)
 
 
-def run_config(cfg, sentences, tokenizer, device):
-    print("\n" + "=" * 80)
-    print(f"RUNNING: {cfg}")
-    print("=" * 80)
-    model, train_loss = train_one(cfg, sentences, tokenizer, device)
-    stsb = evaluate_stsb(model, tokenizer, device)
-    row = asdict(cfg)
-    row.update({"train_loss": train_loss, "stsb_spearman": stsb})
-    print(f"RESULT: {row}")
-    return row, model
+@contextmanager
+def atomic_output(path):
+    with NamedTemporaryFile(dir=path.parent, delete=False) as file:
+        temporary = Path(file.name)
+        try:
+            yield file
+            file.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def read_results(path):
+    if not path.exists():
+        return {}
+
+    results = {}
+    for row in pd.read_csv(path, float_precision="round_trip").to_dict("records"):
+        cfg = P1Config(row["temperature"], row["pooling"], row["projection"], row["seed"])
+        if cfg in results or not math.isfinite(row["stsb_spearman"]):
+            raise ValueError(f"Invalid or duplicate result for {cfg} in {path}")
+        results[cfg] = row
+    return results
+
+
+def save_checkpoint(model, row, model_dir, checkpoint_score):
+    marker = model_dir / "best_model.json"
+    marker.unlink(missing_ok=True)
+    with atomic_output(model_dir / "best_model.pt") as file:
+        torch.save(model.state_dict(), file)
+    with atomic_output(marker) as file:
+        metadata = {"result": row, "checkpoint_stsb_spearman": checkpoint_score}
+        file.write(json.dumps(metadata, indent=2).encode())
+
+
+def run_ablation(output_dir, device, smoke=False):
+    csv_path = output_dir / config.RESULTS_CSV
+    model_dir = output_dir / config.MODEL_DIR
+    model_dir.mkdir(parents=True, exist_ok=True)
+    results = read_results(csv_path)
+    print(f"Using {device}. Loaded {len(results)} completed runs from {csv_path}.")
+    tokenizer = AutoTokenizer.from_pretrained(config.BERT_MODEL_NAME)
+    sentences = load_sentences(8 if smoke else config.MAX_TRAIN_SAMPLES)
+    split = "validation[:32]" if smoke else "validation"
+    dataset = load_dataset("nyu-mll/glue", "stsb", split=split)
+    stsb = tuple(list(dataset[column]) for column in ("sentence1", "sentence2", "label"))
+    training = {"batch_size": 4, "epochs": 1} if smoke else {}
+
+    def score(cfg):
+        return results[cfg]["stsb_spearman"]
+
+    def run_missing(configs, eligible_configs):
+        for cfg in configs:
+            if cfg in results:
+                continue
+            print(f"Training {cfg}")
+            model, train_loss = train_one(cfg, sentences, tokenizer, device, **training)
+            stsb_score = evaluate_stsb(model, tokenizer, device, stsb)
+            if not math.isfinite(train_loss) or not math.isfinite(stsb_score):
+                raise ValueError(f"Non-finite loss or STS-B correlation for {cfg}")
+            row = {**asdict(cfg), "train_loss": train_loss, "stsb_spearman": stsb_score}
+            previous_best = max((score(c) for c in eligible_configs if c in results), default=-math.inf)
+            if stsb_score > previous_best:
+                save_checkpoint(model, row, model_dir, stsb_score)
+            results[cfg] = row
+            with atomic_output(csv_path) as file:
+                pd.DataFrame(results.values()).to_csv(file, index=False)
+            del model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    run_missing(SEARCH_CONFIGS, SEARCH_CONFIGS)
+    best = max(SEARCH_CONFIGS, key=score)
+    final_configs = [P1Config(best.temperature, best.pooling, best.projection, seed) for seed in FINAL_SEEDS]
+    run_missing(final_configs, final_configs)
+
+    winner = max(final_configs, key=score)
+    marker = model_dir / "best_model.json"
+    metadata = json.loads(marker.read_text()) if marker.exists() else {}
+    if metadata.get("result") != results[winner] or not (model_dir / "best_model.pt").is_file():
+        print(f"Rebuilding the checkpoint for {winner} from the saved run settings.")
+        model, _ = train_one(winner, sentences, tokenizer, device, **training)
+        checkpoint_score = evaluate_stsb(model, tokenizer, device, stsb)
+        if not math.isfinite(checkpoint_score):
+            raise ValueError(f"Non-finite STS-B correlation for rebuilt checkpoint {winner}")
+        save_checkpoint(model, results[winner], model_dir, checkpoint_score)
+        del model
+
+    final_scores = [score(cfg) for cfg in final_configs]
+    print(pd.DataFrame(results.values()).sort_values("stsb_spearman", ascending=False).to_string(index=False))
+    print(f"Best search config: {best}")
+    print(f"STS-B validation Spearman over {FINAL_SEEDS}: {np.mean(final_scores):.4f} ± {np.std(final_scores, ddof=1):.4f}")
+    print(f"E5-small-v2 STS-B validation Spearman: {benchmark_e5(stsb, device):.4f}")
 
 
 def main():
-    os.makedirs(config.MODEL_DIR, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    tokenizer = AutoTokenizer.from_pretrained(config.BERT_MODEL_NAME)
-    sentences = load_sentences()
+    parser = argparse.ArgumentParser(description="Fine-tune and evaluate a SimCSE sentence encoder.")
+    parser.add_argument("--output-dir", type=Path, default=Path.cwd())
+    parser.add_argument("--smoke", action="store_true", help="Run the full grid on a few examples.")
+    parser.add_argument("--device", choices=("cpu", "cuda"))
+    args = parser.parse_args()
 
-    # resume from csv if kaggle randomly kills the session
-    if os.path.exists(config.RESULTS_CSV):
-        try:
-            results = pd.read_csv(config.RESULTS_CSV).to_dict("records")
-            print(f"loaded {len(results)} previous results from {config.RESULTS_CSV}")
-        except Exception as e:
-            print(f"couldnt load previous results: {e}")
-            results = []
-    else:
-        results = []
-
-    seen = {(r["temperature"], r["pooling"], r["projection"], r["seed"]) for r in results}
-
-    for cfg in SEARCH_CONFIGS:
-        key = (cfg.temperature, cfg.pooling, cfg.projection, cfg.seed)
-        if key in seen:
-            print(f"skipping already completed config: {cfg}")
-            continue
-
-        row, _ = run_config(cfg, sentences, tokenizer, device)
-        results.append(row)
-        pd.DataFrame(results).to_csv(config.RESULTS_CSV, index=False)
-        
-        # free up gpu mem between runs so it doesnt pile up
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    search_df = pd.DataFrame(results)
-    best = search_df.sort_values("stsb_spearman", ascending=False).iloc[0]
-    best_config = P1Config(
-        float(best["temperature"]),
-        str(best["pooling"]),
-        str(best["projection"]),
-        int(best["seed"]),
-    )
-
-    print("\nBEST SEARCH CONFIG")
-    print(best_config)
-
-    final_configs = [
-        P1Config(best_config.temperature, best_config.pooling, best_config.projection, seed)
-        for seed in FINAL_SEEDS
-    ]
-
-    seen = {(r["temperature"], r["pooling"], r["projection"], r["seed"]) for r in results}
-    best_stsb = -1.0
-    for cfg in final_configs:
-        key = (cfg.temperature, cfg.pooling, cfg.projection, cfg.seed)
-        if key in seen:
-            continue
-        row, model = run_config(cfg, sentences, tokenizer, device)
-        results.append(row)
-        pd.DataFrame(results).to_csv(config.RESULTS_CSV, index=False)
-
-        if row["stsb_spearman"] > best_stsb:
-            best_stsb = row["stsb_spearman"]
-            save_path = os.path.join(config.MODEL_DIR, "best_model.pt")
-            print(f"New best model found (STS-B: {best_stsb:.4f})! Saving to {save_path}...")
-            torch.save(model.state_dict(), save_path)
-
-        # free up gpu mem between runs
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    df = pd.DataFrame(results)
-    final_df = df[
-        (df["temperature"] == best_config.temperature)
-        & (df["pooling"] == best_config.pooling)
-        & (df["projection"] == best_config.projection)
-        & (df["seed"].isin(FINAL_SEEDS))
-    ]
-
-    e5_score = benchmark_e5()
-    mean = final_df["stsb_spearman"].mean()
-    std = final_df["stsb_spearman"].std(ddof=1)
-
-    print("\n" + "=" * 80)
-    print("FINAL RESULTS")
-    print("=" * 80)
-    print(df.sort_values("stsb_spearman", ascending=False).to_string(index=False))
-    print(f"\nbest config: temp={best_config.temperature}, pooling={best_config.pooling}, projection={best_config.projection}")
-    print(f"final stsb spearman over seeds {FINAL_SEEDS}: {mean:.4f} +/- {std:.4f}")
-    print(f"e5-small-v2 stsb spearman: {e5_score:.4f}")
-    print("\nfor the resume:")
-    print(
-        f"contrastive sentence encoder, finetuned bert + infonce, "
-        f"{mean:.4f} +/- {std:.4f} stsb spearman (5 seeds), "
-        f"ablated temp/pooling/projection"
-    )
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    output_dir = args.output_dir / "smoke" if args.smoke else args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with FileLock(output_dir / ".ablation.lock", timeout=0):
+            run_ablation(output_dir, torch.device(device), smoke=args.smoke)
+    except Timeout:
+        parser.error(f"Another ablation is using {output_dir}. Choose a different output directory.")
 
 if __name__ == "__main__":
     main()
