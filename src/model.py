@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from transformers import AutoModel
-import config
+from src import config
 
 class SentenceEmbeddingModel(nn.Module):
     def __init__(self, pooling="mean", projection="nonlinear"):
@@ -9,13 +9,13 @@ class SentenceEmbeddingModel(nn.Module):
         self.bert = AutoModel.from_pretrained(config.BERT_MODEL_NAME)
         
         # Enable gradient checkpointing to save VRAM when fine-tuning full BERT
-        self.bert.gradient_checkpointing_enable()
+        self.bert.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         if projection == "nonlinear":
             self.projection_head = nn.Sequential(
                 nn.Linear(config.BERT_HIDDEN_SIZE, 256),
                 nn.ReLU(),
-                nn.Dropout(0.1), # simcse dropout mask - crucial for positive pairs
+                nn.Dropout(0.1),
                 nn.Linear(256, config.EMBEDDING_DIM),
             )
         elif projection == "linear":
@@ -32,7 +32,7 @@ class SentenceEmbeddingModel(nn.Module):
         if self.pooling == "cls":
             return token_embeddings[:, 0, :]
         if self.pooling == "mean":
-            mask = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+            mask = attention_mask.unsqueeze(-1).float()
             summed = torch.sum(token_embeddings * mask, dim=1)
             counts = torch.clamp(mask.sum(dim=1), min=1e-9)
             return summed / counts
